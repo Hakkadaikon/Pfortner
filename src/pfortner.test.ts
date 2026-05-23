@@ -370,3 +370,85 @@ Deno.test({
     await new Promise((r) => setTimeout(r, 100));
   },
 });
+
+Deno.test({
+  name: 'clientDisconnect fires when client closes the WebSocket',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const env = await createEnv();
+    let disconnectFired = false;
+    env.proxy.on('clientDisconnect', () => {
+      disconnectFired = true;
+    });
+    env.ws.close();
+    await delay(200);
+    assertEquals(disconnectFired, true);
+    await env.cleanup();
+  },
+});
+
+Deno.test({
+  name: 'clientDisconnect fires when proxy.closeSocket() is called server-side',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    const env = await createEnv();
+    let disconnectCount = 0;
+    env.proxy.on('clientDisconnect', () => {
+      disconnectCount++;
+    });
+    env.proxy.closeSocket();
+    // Allow both the synchronous emit and the async 'close' event to land
+    await delay(200);
+    assertEquals(disconnectCount, 1, 'clientDisconnect must fire exactly once');
+    await env.cleanup();
+  },
+});
+
+Deno.test({
+  name: 'clientDisconnect fires when upstream connection fails before client open',
+  sanitizeOps: false,
+  sanitizeResources: false,
+  async fn() {
+    // Use an unreachable upstream so serverSocket.opened rejects and
+    // closeClientSocket is called before the client 'open' event arrives.
+    const proxy = pfortnerInit('ws://127.0.0.1:1', {
+      sendAuthOnConnect: false,
+      upstreamRawAddress: 'ws://127.0.0.1:1',
+    });
+
+    let disconnectFired = false;
+    proxy.on('clientDisconnect', () => {
+      disconnectFired = true;
+    });
+
+    const proxyAc = new AbortController();
+    const proxyPort = await new Promise<number>((resolve) => {
+      Deno.serve({
+        port: 0,
+        signal: proxyAc.signal,
+        onListen({ port }) {
+          resolve(port);
+        },
+      }, (req) => proxy.createSession(req));
+    });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${proxyPort}`);
+    await new Promise<void>((resolve) => {
+      ws.onclose = () => resolve();
+      ws.onerror = () => resolve();
+      setTimeout(resolve, 2000);
+    });
+
+    await delay(200);
+    assertEquals(disconnectFired, true, 'clientDisconnect must fire even on upstream failure');
+
+    try {
+      ws.close();
+    } catch { /* ignore */ }
+    proxy.closeSocket();
+    proxyAc.abort();
+    await delay(100);
+  },
+});

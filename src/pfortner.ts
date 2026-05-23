@@ -94,6 +94,7 @@ export const pfortnerInit = (
 
   let serverConnected = false;
   let clientConnected = false;
+  let disconnectFired = false;
 
   let clientPolicies: Policies<any[]> = [];
   let serverPolicies: Policies<any[]> = [];
@@ -207,7 +208,7 @@ export const pfortnerInit = (
     });
     clientSocket.addEventListener('close', () => {
       clientConnected = false;
-      listeners.clientDisconnect.forEach((cb) => cb());
+      emitClientDisconnect();
       closeServerSocket();
     });
 
@@ -297,8 +298,13 @@ export const pfortnerInit = (
     }).finally(() => {
       if (serverConnected) {
         listeners.serverDisconnect.forEach((cb) => cb());
-        closeClientSocket();
       }
+      // Always close the client side when the upstream socket terminates,
+      // including the case where the upstream connection never opened
+      // (e.g. relay refused). Without this, closeClientSocket() and the
+      // ensuing clientDisconnect would never fire and ConnectionManager
+      // would leak the slot.
+      closeClientSocket();
     });
 
     return opts.response;
@@ -310,11 +316,6 @@ export const pfortnerInit = (
   function off<T extends keyof SocketEvent, U extends SocketEvent[T]>(type: T, cb: U): void {
     const index = listeners[type].indexOf(cb);
     if (index !== -1) listeners[type].splice(index, 1);
-  }
-  function clearAllListeners(): void {
-    (Object.keys(listeners) as (keyof SocketEvent)[]).forEach((key) => {
-      listeners[key] = [] as any;
-    });
   }
 
   function sendAuthMessage(): void {
@@ -429,12 +430,23 @@ export const pfortnerInit = (
     await serverWriter.write(message);
   }
 
+  function emitClientDisconnect(): void {
+    if (disconnectFired) return;
+    disconnectFired = true;
+    listeners.clientDisconnect.forEach((cb) => cb());
+  }
+
   function closeClientSocket(code = 1000): void {
+    clearIdleTimeout();
     if (clientConnected) {
-      clearIdleTimeout();
       clientSocket.close(code);
       clientConnected = false;
     }
+    // Fire clientDisconnect even if the WebSocket upgrade never completed
+    // (e.g. upstream relay rejected before client 'open' event), so the
+    // connection manager always unregisters the slot. The 'close' event
+    // handler is also idempotent via disconnectFired.
+    emitClientDisconnect();
   }
 
   function closeServerSocket(): void {
@@ -453,7 +465,11 @@ export const pfortnerInit = (
   function closeSocket(code = 1000): void {
     closeClientSocket(code);
     closeServerSocket();
-    clearAllListeners();
+    // Note: do NOT clearAllListeners() here. The 'close' event on clientSocket
+    // is delivered asynchronously after close() returns, and clearing listeners
+    // synchronously would drop the clientDisconnect callback, causing the
+    // ConnectionManager to leak the slot. emitClientDisconnect() above already
+    // fires the disconnect notification idempotently.
   }
 
   function setIdleTimeout(): void {
